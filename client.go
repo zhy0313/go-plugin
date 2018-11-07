@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"hash"
@@ -170,6 +172,11 @@ type ClientConfig struct {
 	// Logger is the logger that the client will used. If none is provided,
 	// it will default to hclog's default logger.
 	Logger hclog.Logger
+
+	// AutoMTLS has the client server automatically negotiate mTLS for transport
+	// authentication. TLSConfig must be unset, and the server must not
+	// configure a TLSProvider.
+	AutoMTLS bool
 }
 
 // ReattachConfig is used to configure a client to reattach to an
@@ -545,6 +552,28 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		}
 	}
 
+	// Setup a temporary certificate for client/server mtls, and send the public
+	// certificate to the plugin.
+	if c.config.AutoMTLS {
+		certPEM, keyPEM, err := generateCert()
+		if err != nil {
+			c.logger.Error("failed to generate client certificate", "error", err)
+			return nil, err
+		}
+		cert, err := tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			c.logger.Error("failed to parse client certificate", "error", err)
+			return nil, err
+		}
+
+		cmd.Env = append(cmd.Env, fmt.Sprintf("PLUGIN_CLIENT_CERT=%s", certPEM))
+
+		c.config.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			ServerName:   "localhost",
+		}
+	}
+
 	c.logger.Debug("starting plugin", "path", cmd.Path, "args", cmd.Args)
 	err = cmd.Start()
 	if err != nil {
@@ -649,7 +678,7 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		// Trim the line and split by "|" in order to get the parts of
 		// the output.
 		line := strings.TrimSpace(string(lineBytes))
-		parts := strings.SplitN(line, "|", 6)
+		parts := strings.SplitN(line, "|", 7)
 		if len(parts) < 4 {
 			err = fmt.Errorf(
 				"Unrecognized remote plugin message: %s\n\n"+
@@ -718,10 +747,34 @@ func (c *Client) Start() (addr net.Addr, err error) {
 			return addr, err
 		}
 
+		// we may have a TLS certificate for the server
+		if len(parts) >= 6 && parts[5] != "" && c.protocol == ProtocolGRPC {
+			c.loadServerCert(parts[5])
+		}
 	}
 
 	c.address = addr
 	return
+}
+
+func (c *Client) loadServerCert(cert string) {
+	certPool := x509.NewCertPool()
+
+	asn1, err := base64.RawStdEncoding.DecodeString(cert)
+	if err != nil {
+		c.logger.Error("failed to decode cert data", "error", err)
+		return
+	}
+
+	x509Cert, err := x509.ParseCertificate([]byte(asn1))
+	if err != nil {
+		c.logger.Error("failed to parse certificate", "error", err)
+		return
+	}
+
+	certPool.AddCert(x509Cert)
+
+	c.config.TLSConfig.RootCAs = certPool
 }
 
 // checkProtoVersion returns the negotiated version and PluginSet.
